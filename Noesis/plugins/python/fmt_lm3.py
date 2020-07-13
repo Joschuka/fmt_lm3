@@ -4,7 +4,7 @@ import pickle
 import zlib
 import math
 
-#Version 1.0
+#Version 1.1
 
 # =================================================================
 # Plugin options
@@ -13,6 +13,7 @@ import math
 globalPath = None
 
 bLoadMaterials = True
+bLoadAnimations = True
 
 #You can use these fields if the skeleton is misplaced for some reason.
 skelPosCorrection = NoeVec3([0,0,0])
@@ -55,11 +56,13 @@ def InitializeFromDict():
 	global textPath
 	global modelPath
 	global animPath
+	global animBundlePath
 	global filePath
 	destPath = os.path.dirname(rapi.getInputName()) + os.sep + rapi.getLocalFileName(dataFileName)[:-5]
 	modelPath = destPath + os.sep + "Models"
 	textPath = destPath + os.sep + "Textures"
 	animPath = destPath + os.sep + "Animations"
+	animBundlePath = destPath + os.sep + "AnimationPacks"
 	filePath = destPath + os.sep + "File_Data"	
 	
 	if not os.path.exists(modelPath):
@@ -68,6 +71,8 @@ def InitializeFromDict():
 		os.makedirs(textPath)
 	if not os.path.exists(animPath):
 		os.makedirs(animPath)
+	if not os.path.exists(animBundlePath):
+		os.makedirs(animBundlePath)	
 	if not os.path.exists(filePath):
 		os.makedirs(filePath)	
 
@@ -93,6 +98,7 @@ def InitializeFromAsset():
 	modelPath = rootPath + os.sep + "Models"
 	textPath = rootPath + os.sep + "Textures"
 	animPath = rootPath + os.sep + "Animations"
+	animBundlePath = rootPath + os.sep + "AnimationPacks"
 	filePath = rootPath + os.sep + "File_Data"	
 	
 	if not os.path.exists(modelPath):
@@ -101,6 +107,8 @@ def InitializeFromAsset():
 		os.makedirs(textPath)
 	if not os.path.exists(animPath):
 		os.makedirs(animPath)
+	if not os.path.exists(animBundlePath):
+		os.makedirs(animBundlePath)	
 	if not os.path.exists(filePath):
 		os.makedirs(filePath)
 
@@ -287,6 +295,15 @@ class LM3AnimationAsset:
 class LM3AnimationBundleAsset:
 	def __init__(self):
 		self.animationIndices =[]
+		
+class LM3BoneHeader:
+	def __init__(self):
+		self.hash = None
+		self.index = -1
+		self.magic = None
+		self.type = -1
+		self.opcode = -1
+		self.offset = -1
 
 class LM3MeshAsset:
 	def __init__(self):
@@ -610,7 +627,9 @@ def ExtractAssets():
 	
 	for i,animationAsset in enumerate(animationAssetList):
 		pickle.dump( animationAsset, open( animPath + os.sep + "anim_" + str(i) +".lm3a", "wb" ))
-		
+	
+	for i,animationBundleAsset in enumerate(animationBundleAssetList):
+		pickle.dump( animationBundleAsset, open( animBundlePath + os.sep + "animPack_" + str(i) +".lm3ap", "wb" ))
 	print("Files and assets extracted")
 	
 def ExtractDict(data, mdlList):
@@ -931,7 +950,218 @@ def processModel(modelAssets):
 				bone.setMatrix(bone.getMatrix() * modelAsset.jointList[parentId].getMatrix())
 			else:
 				bone.setMatrix(bone.getMatrix()*NoeAngles([90,0,-90]).toMat43())
+				
+		#Animation
+		if bLoadAnimations:
+			animBPath = rapi.loadPairedFileGetPath("animPack file", ".lm3ap")
+			if animBPath is not None:
+				animationBundleAsset = pickle.load(open( animBPath[1], "rb" ))
+				# animList = modelAsset.animationIndices if bLoadAnimations else []
+				animList = animationBundleAsset.animationIndices
+				for n,animationindex in enumerate(animList):
+					animationAsset = pickle.load(open( animPath+os.sep+"anim_" + str(animationindex)+".lm3a", "rb" ))
+					keyframedJointList = []
+					# print(animationAsset.dataOffset)
+					# print(animationAsset.dataSize)
+					bs53.seek(animationAsset.dataOffset)
+					bs53.readUInt() # 0, always ?
+					boneHeaderCount = bs53.readUShort()
+					frameCount = bs53.readUShort()
+					duration = bs53.readFloat()
+					bs53.readUInt() # 0, always ?
+					bs53.seek(0x18,1) # Not sure what the two first chunks mean
+					rotNoeKeyFramedValues = {}
+					posNoeKeyFramedValues = {}
+					scaleNoeKeyFramedValues = {}
+					unknownRotOpcode = {}
+					unknownPosOpcode = {}
+					unknownScaleOpcode = {}
+					for i in range(boneHeaderCount-2): #Sometimes additionnal chunks starting with 0x00000505, don't really care since we have offsets
+						boneHeader = LM3BoneHeader()
+						boneHeader.hash = hex(bs53.readUInt())
+						boneHeader.index = bs53.readUByte()
+						boneHeader.magic = bs53.readUByte()
+						boneHeader.type = bs53.readUByte()
+						boneHeader.opcode = bs53.readUByte()
+						boneHeader.offset = bs53.readUInt()
+						checkpoint = bs53.tell()
+						if boneHeader.hash in modelAsset.hashToBoneID71:
+							# if boneHeader.magic != 0xC0 and boneHeader.magic != 0xC1 and boneHeader.magic != 0xC2:
+								# print("New magic found")
+								# print(boneHeader.magic)
+							#rotation
+							if boneHeader.type == 1:
+								rotNoeKeyFramedValues[boneHeader.hash] = []
+								if boneHeader.opcode == 0x0F: #confirmed
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									for j in range(frameCount):
+										quaternion = NoeQuat([bs53.readFloat() for a in range(4)]).transpose()
+										rotationKeyframedValue = NoeKeyFramedValue(duration/frameCount*j,quaternion)
+										rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								elif boneHeader.opcode == 0x13: #not sure but makes sense
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									count = bs53.readUInt()
+									for j in range(count):
+										quaternion = NoeQuat([bs53.readFloat() for a in range(4)]).transpose()
+										rotationKeyframedValue = NoeKeyFramedValue(duration/count*j,quaternion)
+										rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								elif boneHeader.opcode == 0x15: #confirmed
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									quaternion = NoeQuat([bs53.readFloat() for a in range(4)]).transpose()
+									rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								# elif boneHeader.opcode == 0x16: #not sure at all
+									# flag to say nothing do be done ?
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# quaternion = NoeQuat([bs53.readShort()/0x7FFF for a in range(4)]).transpose()
+									# rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									# rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								elif boneHeader.opcode == 0x17: #not sure at all
+									# Some weird thing is going on. Normalization or something needed ?							
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									quaternion = NoeAngles([bs53.readShort()/180,0,0]).toQuat()
+									rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								elif boneHeader.opcode == 0x18: #somewhat confirmed (priestess cloth)
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									for j in range(frameCount):
+										quaternion = NoeAngles([0,0,bs53.readShort()/180]).toQuat()
+										rotationKeyframedValue = NoeKeyFramedValue(duration/frameCount*j,quaternion)
+										rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								elif boneHeader.opcode == 0x19: #somewhat confirmed (priestess arms)
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									for j in range(frameCount):
+										quaternion = NoeAngles([0,bs53.readShort()/180,0]).toQuat()
+										rotationKeyframedValue = NoeKeyFramedValue(duration/frameCount*j,quaternion)
+										rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								# elif boneHeader.opcode == 0x1A: #need confirm, king boo
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# bs53.readShort()
+									# quaternion = NoeAngles([bs53.readShort()/180,0,0]).toQuat()
+									# rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									# rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								# elif boneHeader.opcode == 0x1B: #seen on maid
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# bs53.readShort()
+									# quaternion = NoeAngles([bs53.readShort()/180,0,0]).toQuat()
+									# rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									# rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								# elif boneHeader.opcode == 0x1C: #need confirm (pianist tail)
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# bs53.readShort()
+									# quaternion = NoeAngles([0,bs53.readShort()/180,0]).toQuat()
+									# rotationKeyframedValue = NoeKeyFramedValue(0,quaternion)
+									# rotNoeKeyFramedValues[boneHeader.hash].append(rotationKeyframedValue)
+								else:
+									if hex(boneHeader.opcode) in unknownRotOpcode:
+										unknownRotOpcode[hex(boneHeader.opcode)] += 1
+									else:
+										unknownRotOpcode[hex(boneHeader.opcode)] = 1
+							#location
+							elif boneHeader.type == 3:
+								posNoeKeyFramedValues[boneHeader.hash] = []
+								if boneHeader.opcode == 0x6: #confirmed, somewhat (priestess movement)
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									for j in range(frameCount):
+										position = NoeVec3([bs53.readFloat() for a in range(3)])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/frameCount*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0x8: #guess
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									for j in range(frameCount):
+										position = NoeVec3([bs53.readHalfFloat() for a in range(3)])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/frameCount*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0x9: #to be confirmed but makes sense
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									count = bs53.readUInt()
+									for j in range(count):
+										position = NoeVec3([bs53.readFloat() for a in range(3)])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/count*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0xA: #to be confirmed but makes sense
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									count = bs53.readUShort()
+									for j in range(count):
+										position = NoeVec3([bs53.readHalfFloat() for a in range(3)])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/count*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0xB: #to be confirmed but makes sense
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									position = NoeVec3([bs53.readFloat() for a in range(3)])
+									positionKeyFramedValue = NoeKeyFramedValue(0, position)
+									posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0xC: #confirmed (maid stuff)
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									position = NoeVec3([bs53.readHalfFloat() for a in range(3)])
+									positionKeyFramedValue = NoeKeyFramedValue(0, position)
+									posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0xD: #confirmed (pianist movement)
+									bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									axis = bs53.readUInt()
+									bs53.readBytes(0x8)
+									count = bs53.readUInt()
+									for j in range(count):
+										data = bs53.readFloat()
+										if axis == 0:
+											position = NoeVec3([data,0,0])
+										elif axis == 1:
+											position = NoeVec3([0,data,0])
+										elif axis == 2:
+											position = NoeVec3([0,0,data])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/count*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								elif boneHeader.opcode == 0xE: #confirmed somewhat (Hellen outfit)
+									bs53.seek(animationAsset.dataOffset+ boneHeader.offset)
+									a = bs53.readUInt()
+									bs53.readUShort()
+									count = bs53.readUShort()
+									for j in range(count):
+										position = NoeVec3([bs53.readHalfFloat(),0,0])
+										positionKeyFramedValue = NoeKeyFramedValue(duration/count*j, position)
+										posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								else:
+									if hex(boneHeader.opcode) in unknownPosOpcode:
+										unknownPosOpcode[hex(boneHeader.opcode)] += 1
+									else:
+										unknownPosOpcode[hex(boneHeader.opcode)] = 1
+							#Not confirmed at all, no clue yet. Probably something other than scale
+							# elif boneHeader.type == 2:
+								# scaleNoeKeyFramedValues[boneHeader.hash] = []
+								# posNoeKeyFramedValues[boneHeader.hash] = []
+								# if boneHeader.opcode == 0x2A: #always of length 12 so either 6 HF or 3 F, don't have any clear example
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# scale = NoeVec3([bs53.readHalfFloat() for a in range(3)])
+									# scaleKeyFramedValue = NoeKeyFramedValue(0, scale)
+									# scaleNoeKeyFramedValues[boneHeader.hash].append(scaleKeyFramedValue)
+									# bs53.seek(animationAsset.dataOffset + boneHeader.offset)
+									# position = NoeVec3([bs53.readFloat() for a in range(3)])
+									# positionKeyFramedValue = NoeKeyFramedValue(0, position)
+									# posNoeKeyFramedValues[boneHeader.hash].append(positionKeyFramedValue)
+								# else:
+									# if hex(boneHeader.opcode) in unknownScaleOpcode:
+										# unknownScaleOpcode[hex(boneHeader.opcode)] += 1
+									# else:
+										# unknownScaleOpcode[hex(boneHeader.opcode)] = 1
+						bs53.seek(checkpoint)
+					# print("anim " + str(animationindex))
+					# print(unknownRotOpcode)
+					# print(unknownPosOpcode)
+					for hash in modelAsset.hashToBoneID71:
+						if hash in posNoeKeyFramedValues or hash in rotNoeKeyFramedValues or hash in scaleNoeKeyFramedValues:
+							actionBone = NoeKeyFramedBone(modelAsset.hashToBoneID71[hash])
+							#root bone rotation ignored as it seem to screw up some stuff
+							if hash in rotNoeKeyFramedValues and hash != "0x2e51a3":
+								actionBone.setRotation(rotNoeKeyFramedValues[hash], noesis.NOEKF_ROTATION_QUATERNION_4)
+							if hash in posNoeKeyFramedValues:
+								actionBone.setTranslation(posNoeKeyFramedValues[hash], noesis.NOEKF_TRANSLATION_VECTOR_3)
+							if hash in scaleNoeKeyFramedValues:
+								actionBone.setScale(scaleNoeKeyFramedValues[hash], noesis.NOEKF_SCALE_VECTOR_3)
+							keyframedJointList.append(actionBone)
+					anim = NoeKeyFramedAnim("anim_"+str(animationindex), modelAsset.jointList, keyframedJointList, 30)
+					animationList.append(anim)
 		del bs53
+		
 		
 		#Geometry
 		InitializeFileStream(54)
@@ -989,6 +1219,8 @@ def processModel(modelAssets):
 		mdl.setModelMaterials(NoeModelMaterials(textureList, []))
 		if len(modelAsset.jointList) > 0:
 			mdl.setBones(modelAsset.jointList)
+		if len(animationList) > 0:
+			mdl.setAnims(animationList)
 		mdl.setModelMaterials(NoeModelMaterials(textureList, materialList))
 		modelList.append(mdl)
 			
